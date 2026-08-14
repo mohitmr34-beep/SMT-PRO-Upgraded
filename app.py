@@ -10,7 +10,7 @@ import datetime
 # CONFIG
 # -------------------------------
 st.set_page_config(page_title="SMT PRO SNIPER", layout="wide")
-st.markdown("<h2 style='text-align:center;'>SMT PRO SNIPER</h2><hr>", unsafe_allow_html=True)
+st.markdown("<h2 style='text-align:center;'>SMT PRO SNIPER (VWAP)</h2><hr>", unsafe_allow_html=True)
 
 # -------------------------------
 # TIME FILTER
@@ -27,7 +27,7 @@ if st.checkbox("Auto Refresh (5 min)"):
     st.rerun()
 
 # -------------------------------
-# SAFE VALUE EXTRACTOR
+# SAFE VALUE
 # -------------------------------
 def val(x):
     try:
@@ -82,7 +82,6 @@ else:
                     session.cookies.set(k, v, domain="chartink.com")
 
             session.get("https://chartink.com")
-
             xsrf = unquote(session.cookies.get("XSRF-TOKEN", ""))
 
             headers = {
@@ -106,7 +105,6 @@ else:
             return []
 
     if st.button("Load Chartink Stocks"):
-
         symbols = get_symbols(cookie)
 
         if symbols:
@@ -165,6 +163,18 @@ def calculate_atr(df, period=14):
     return atr.iloc[-1] if not pd.isna(atr.iloc[-1]) else 0
 
 # -------------------------------
+# VWAP
+# -------------------------------
+def calculate_vwap(df):
+
+    df = df.copy()
+
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    vwap = (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
+
+    return vwap.iloc[-1]
+
+# -------------------------------
 # RISK
 # -------------------------------
 capital = st.sidebar.number_input("Capital", value=50000)
@@ -192,7 +202,7 @@ def position(entry, sl):
     return qty, cap, risk
 
 # -------------------------------
-# SNIPER LOGIC
+# SNIPER + VWAP LOGIC
 # -------------------------------
 def analyze(df):
 
@@ -201,7 +211,6 @@ def analyze(df):
 
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
 
-    # SAFE VALUES
     h1, l1, c1c = val(c1["High"]), val(c1["Low"]), val(c1["Close"])
     h2, l2, c2c = val(c2["High"]), val(c2["Low"]), val(c2["Close"])
     h3, l3, c3c = val(c3["High"]), val(c3["Low"]), val(c3["Close"])
@@ -209,36 +218,34 @@ def analyze(df):
     v1, v2, v3 = val(c1["Volume"]), val(c2["Volume"]), val(c3["Volume"])
 
     atr = calculate_atr(df)
+    vwap = calculate_vwap(df)
 
     signal = "WAIT"
     entry = sl = target = None
     score = 0
 
-    # TRAPS
     fake_up = (h2 > h1) and (c3c < h2)
     fake_down = (l2 < l1) and (c3c > l2)
 
-    # VOLUME
     if (v3 > v2) and (v2 > v1):
         score += 30
 
-    # BUY
-    if (c3c > h2) and not fake_up:
+    # BUY (Above VWAP only)
+    if (c3c > h2) and not fake_up and (c3c > vwap):
         signal = "BUY"
         entry = c3c
         sl = l2
         target = entry + (2 * atr)
         score += 40
 
-    # SELL
-    elif (c3c < l2) and not fake_down:
+    # SELL (Below VWAP only)
+    elif (c3c < l2) and not fake_down and (c3c < vwap):
         signal = "SELL"
         entry = c3c
         sl = h2
         target = entry - (2 * atr)
         score += 40
 
-    # SIDEWAYS FILTER
     if abs(h2 - l2) < atr * 0.5:
         return "WAIT", None, None, None, 0
 
@@ -273,7 +280,6 @@ if st.button("Run Sniper"):
         })
 
     res_df = pd.DataFrame(results)
-
     st.dataframe(res_df, use_container_width=True)
 
     best = res_df[

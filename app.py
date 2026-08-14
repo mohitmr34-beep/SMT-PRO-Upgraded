@@ -27,10 +27,20 @@ if st.checkbox("Auto Refresh (5 min)"):
     st.rerun()
 
 # -------------------------------
+# SAFE VALUE EXTRACTOR
+# -------------------------------
+def val(x):
+    try:
+        if isinstance(x, pd.Series):
+            return float(x.iloc[0])
+        return float(x)
+    except:
+        return 0.0
+
+# -------------------------------
 # SOURCE
 # -------------------------------
 source = st.radio("Stock Source", ["Manual CSV", "Chartink LIVE"], horizontal=True)
-
 symbols = []
 
 # ===============================
@@ -119,18 +129,26 @@ else:
 timeframe = st.selectbox("Timeframe", ["5m", "15m"], index=0)
 
 # -------------------------------
-# DATA
+# DATA FETCH
 # -------------------------------
 @st.cache_data(ttl=60)
 def get_data(sym):
     try:
         df = yf.download(sym, period="5d", interval=timeframe, progress=False)
-        return df.dropna() if df is not None and not df.empty else None
+
+        if df is None or df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        return df.dropna()
+
     except:
         return None
 
 # -------------------------------
-# ATR (FIXED)
+# ATR
 # -------------------------------
 def calculate_atr(df, period=14):
 
@@ -183,12 +201,12 @@ def analyze(df):
 
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
 
-    # 🔥 FORCE FLOAT (CRITICAL FIX)
-    h1, l1, c1_close = float(c1["High"]), float(c1["Low"]), float(c1["Close"])
-    h2, l2, c2_close = float(c2["High"]), float(c2["Low"]), float(c2["Close"])
-    h3, l3, c3_close = float(c3["High"]), float(c3["Low"]), float(c3["Close"])
+    # SAFE VALUES
+    h1, l1, c1c = val(c1["High"]), val(c1["Low"]), val(c1["Close"])
+    h2, l2, c2c = val(c2["High"]), val(c2["Low"]), val(c2["Close"])
+    h3, l3, c3c = val(c3["High"]), val(c3["Low"]), val(c3["Close"])
 
-    v1, v2, v3 = float(c1["Volume"]), float(c2["Volume"]), float(c3["Volume"])
+    v1, v2, v3 = val(c1["Volume"]), val(c2["Volume"]), val(c3["Volume"])
 
     atr = calculate_atr(df)
 
@@ -196,42 +214,39 @@ def analyze(df):
     entry = sl = target = None
     score = 0
 
-    # -------------------------------
-    # 🔥 SAFE LOGIC (NO ERROR NOW)
-    # -------------------------------
-    fake_up = (h2 > h1) and (c3_close < h2)
-    fake_down = (l2 < l1) and (c3_close > l2)
+    # TRAPS
+    fake_up = (h2 > h1) and (c3c < h2)
+    fake_down = (l2 < l1) and (c3c > l2)
 
-    # Volume condition
-    vol_ok = (v3 > v2) and (v2 > v1)
-    if vol_ok:
+    # VOLUME
+    if (v3 > v2) and (v2 > v1):
         score += 30
 
     # BUY
-    if (c3_close > h2) and (not fake_up):
+    if (c3c > h2) and not fake_up:
         signal = "BUY"
-        entry = c3_close
+        entry = c3c
         sl = l2
         target = entry + (2 * atr)
         score += 40
 
     # SELL
-    elif (c3_close < l2) and (not fake_down):
+    elif (c3c < l2) and not fake_down:
         signal = "SELL"
-        entry = c3_close
+        entry = c3c
         sl = h2
         target = entry - (2 * atr)
         score += 40
 
-    # Sideways filter
+    # SIDEWAYS FILTER
     if abs(h2 - l2) < atr * 0.5:
         return "WAIT", None, None, None, 0
 
-    # Final filter
     if score < 50:
         return "WAIT", None, None, None, score
 
     return signal, entry, sl, target, score
+
 # -------------------------------
 # RUN
 # -------------------------------

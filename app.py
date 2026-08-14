@@ -183,42 +183,55 @@ def analyze(df):
 
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
 
+    # 🔥 FORCE FLOAT (CRITICAL FIX)
+    h1, l1, c1_close = float(c1["High"]), float(c1["Low"]), float(c1["Close"])
+    h2, l2, c2_close = float(c2["High"]), float(c2["Low"]), float(c2["Close"])
+    h3, l3, c3_close = float(c3["High"]), float(c3["Low"]), float(c3["Close"])
+
+    v1, v2, v3 = float(c1["Volume"]), float(c2["Volume"]), float(c3["Volume"])
+
     atr = calculate_atr(df)
 
-    score = 0
     signal = "WAIT"
     entry = sl = target = None
+    score = 0
 
-    fake_up = c2["High"] > c1["High"] and c3["Close"] < c2["High"]
-    fake_down = c2["Low"] < c1["Low"] and c3["Close"] > c2["Low"]
+    # -------------------------------
+    # 🔥 SAFE LOGIC (NO ERROR NOW)
+    # -------------------------------
+    fake_up = (h2 > h1) and (c3_close < h2)
+    fake_down = (l2 < l1) and (c3_close > l2)
 
-    vol_ok = c3["Volume"] > c2["Volume"] > c1["Volume"]
-
+    # Volume condition
+    vol_ok = (v3 > v2) and (v2 > v1)
     if vol_ok:
         score += 30
 
-    if c3["Close"] > c2["High"] and not fake_up:
+    # BUY
+    if (c3_close > h2) and (not fake_up):
         signal = "BUY"
-        entry = float(c3["Close"])
-        sl = float(c2["Low"])
+        entry = c3_close
+        sl = l2
         target = entry + (2 * atr)
         score += 40
 
-    elif c3["Close"] < c2["Low"] and not fake_down:
+    # SELL
+    elif (c3_close < l2) and (not fake_down):
         signal = "SELL"
-        entry = float(c3["Close"])
-        sl = float(c2["High"])
+        entry = c3_close
+        sl = h2
         target = entry - (2 * atr)
         score += 40
 
-    if abs(c2["High"] - c2["Low"]) < atr * 0.5:
+    # Sideways filter
+    if abs(h2 - l2) < atr * 0.5:
         return "WAIT", None, None, None, 0
 
+    # Final filter
     if score < 50:
         return "WAIT", None, None, None, score
 
     return signal, entry, sl, target, score
-
 # -------------------------------
 # RUN
 # -------------------------------

@@ -957,10 +957,295 @@ def analyze(df):
                 entry +
                 (2 * atr)
             )
-            
+
             score += 40
 
             # Extra VWAP confirmation
             score += 10
-            
-            if score >= 5
+
+            if score >= 50:
+
+                return (
+                    signal,
+                    entry,
+                    sl,
+                    target,
+                    min(score, 100),
+                    vwap
+                )
+
+        # ----------------------------------------------------
+        # SELL SETUP
+        # ----------------------------------------------------
+
+        sell_breakdown = (
+            c3_close < l2
+        )
+
+        if (
+            sell_breakdown
+            and not fake_down
+            and below_vwap
+        ):
+
+            signal = "SELL"
+
+            entry = c3_close
+
+            sl = h2
+
+            target = (
+                entry -
+                (2 * atr)
+            )
+
+            score += 40
+
+            # Extra VWAP confirmation
+            score += 10
+
+            if score >= 50:
+
+                return (
+                    signal,
+                    entry,
+                    sl,
+                    target,
+                    min(score, 100),
+                    vwap
+                )
+
+        return (
+            "WAIT",
+            None,
+            None,
+            None,
+            score,
+            vwap
+        )
+
+    except Exception:
+
+        return (
+            "WAIT",
+            None,
+            None,
+            None,
+            0,
+            None
+        )
+
+
+# ============================================================
+# RUN SCANNER
+# ============================================================
+
+if st.button(
+    "🚀 RUN SNIPER SCANNER",
+    type="primary"
+):
+
+    results = []
+
+    progress = st.progress(0)
+
+    total = len(symbols)
+
+    for index, sym in enumerate(symbols):
+
+        df = get_data(
+            sym,
+            timeframe
+        )
+
+        (
+            signal,
+            entry,
+            sl,
+            target,
+            score,
+            vwap
+        ) = analyze(df)
+
+        qty, capital_used, actual_risk = (
+            calculate_position(
+                entry,
+                sl
+            )
+        )
+
+        results.append(
+            {
+                "Stock": sym,
+                "Signal": signal,
+                "Score": score,
+                "VWAP": round(
+                    vwap,
+                    2
+                ) if vwap else None,
+                "Entry": round(
+                    val(entry),
+                    2
+                ) if entry else None,
+                "SL": round(
+                    val(sl),
+                    2
+                ) if sl else None,
+                "Target": round(
+                    val(target),
+                    2
+                ) if target else None,
+                "Qty": qty,
+                "Capital Used": round(
+                    capital_used,
+                    2
+                ),
+                "Risk ₹": round(
+                    actual_risk,
+                    2
+                )
+            }
+        )
+
+        progress.progress(
+            (index + 1) / total
+        )
+
+    progress.empty()
+
+    # ========================================================
+    # RESULTS
+    # ========================================================
+
+    results_df = pd.DataFrame(
+        results
+    )
+
+    # Highest score first
+    results_df = results_df.sort_values(
+        by="Score",
+        ascending=False
+    ).reset_index(
+        drop=True
+    )
+
+    st.subheader(
+        "📊 Scanner Results"
+    )
+
+    st.dataframe(
+        results_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ========================================================
+    # TOP TRADES
+    # ========================================================
+
+    st.subheader(
+        "🔥 TOP SNIPER TRADES"
+    )
+
+    best = results_df[
+        results_df["Signal"].isin(
+            [
+                "BUY",
+                "SELL"
+            ]
+        )
+        &
+        (
+            results_df["Score"] >= 60
+        )
+    ].head(2)
+
+    if best.empty:
+
+        st.warning(
+            "No high-quality BUY/SELL setup found."
+        )
+
+    else:
+
+        for _, row in best.iterrows():
+
+            signal = row["Signal"]
+
+            if signal == "BUY":
+
+                color = "#198754"
+
+            else:
+
+                color = "#dc3545"
+
+            st.markdown(
+                f"""
+                <div style="
+                    padding:18px;
+                    border-radius:12px;
+                    background:{color};
+                    color:white;
+                    margin-bottom:12px;
+                ">
+
+                <h3>
+                {row['Stock']} — {signal}
+                </h3>
+
+                <b>Score:</b>
+                {row['Score']}/100
+
+                &nbsp;&nbsp;
+
+                <b>VWAP:</b>
+                {row['VWAP']}
+
+                <br><br>
+
+                <b>Entry:</b>
+                {row['Entry']}
+
+                &nbsp;&nbsp;
+
+                <b>SL:</b>
+                {row['SL']}
+
+                &nbsp;&nbsp;
+
+                <b>Target:</b>
+                {row['Target']}
+
+                <br><br>
+
+                <b>Quantity:</b>
+                {row['Qty']}
+
+                &nbsp;&nbsp;
+
+                <b>Capital:</b>
+                ₹{row['Capital Used']:,.0f}
+
+                &nbsp;&nbsp;
+
+                <b>Risk:</b>
+                ₹{row['Risk ₹']:,.0f}
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "SMT PRO SNIPER | India timezone: Asia/Kolkata | "
+    "Educational use only. Confirm price, liquidity and risk "
+    "before placing any trade."
+)

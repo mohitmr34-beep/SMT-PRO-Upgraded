@@ -199,48 +199,78 @@ discovery_mode = st.radio(
     horizontal=True,
 )
 
-def chartink_fetch(cookie):
+def chartink_fetch(cookie, screener_url):
+    """Fetch NSE candidates from Chartink using a browser cookie + CSRF session.
+
+    Returns (symbols, diagnostic_message). Chartink is used only for candidate
+    discovery; prices and trade calculations come from Upstox.
+    """
     if not cookie:
-        return []
+        return [], "Chartink cookie is empty."
+
+    if not screener_url.startswith("https://chartink.com/"):
+        return [], "Invalid Chartink URL. Use an https://chartink.com/ screener URL."
 
     session = requests.Session()
-    base_headers = {
+    session.headers.update({
         "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
-            "Chrome/120 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Safari/537.36"
         ),
-        "Accept": "*/*",
-    }
+        "Accept-Language": "en-US,en;q=0.9",
+    })
 
     try:
-        session.get(
-            "https://chartink.com/",
-            headers=base_headers,
-            timeout=15,
-        )
+        # First establish a normal Chartink session.
+        page = session.get(screener_url, timeout=30, allow_redirects=True)
+        if page.status_code != 200:
+            return [], f"Chartink screener page HTTP {page.status_code}."
 
+        # Add the user's browser cookies AFTER the initial request so the
+        # supplied authentication/session values are retained.
         for part in cookie.split(";"):
-            if "=" in part:
-                k, v = part.strip().split("=", 1)
-                session.cookies.set(
-                    k.strip(), v.strip(), domain="chartink.com"
-                )
+            part = part.strip()
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k:
+                session.cookies.set(k, v, domain="chartink.com")
 
-        xsrf = unquote(session.cookies.get("XSRF-TOKEN", ""))
-        headers = dict(base_headers)
-        headers.update(
-            {
-                "Accept": "application/json, text/plain, */*",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": "https://chartink.com/",
-                "Content-Type": "application/json",
-            }
+        # Refresh the screener page with the supplied session. This gives us
+        # the current CSRF token associated with the session.
+        page = session.get(screener_url, timeout=30, allow_redirects=True)
+        if page.status_code != 200:
+            return [], f"Chartink authenticated page HTTP {page.status_code}."
+
+        csrf = ""
+        # Chartink/Laravel commonly exposes csrf-token in a meta tag.
+        import re
+        m = re.search(
+            r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)',
+            page.text,
+            flags=re.I,
         )
-        if xsrf:
-            headers["X-XSRF-TOKEN"] = xsrf
+        if m:
+            csrf = m.group(1)
 
-        # Candidate discovery only. Final trade decision is NOT based
-        # on this daily filter.
+        # Fallback to hidden _token.
+        if not csrf:
+            m = re.search(
+                r'<input[^>]+name=["\']_token["\'][^>]+value=["\']([^"\']+)',
+                page.text,
+                flags=re.I,
+            )
+            if m:
+                csrf = m.group(1)
+
+        # Fallback to XSRF cookie.
+        if not csrf:
+            csrf = unquote(session.cookies.get("XSRF-TOKEN", "") or "")
+
+        # Candidate discovery clause. It intentionally stays broad because
+        # Upstox + the sniper engine perform the intraday filtering later.
         clause = """
         (
           {cash}
@@ -274,37 +304,89 @@ def chartink_fetch(cookie):
           )
         )
         """
+        clause = " ".join(clause.split())
 
-        r = session.post(
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": screener_url,
+            "Origin": "https://chartink.com",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        if csrf:
+            headers["X-CSRF-TOKEN"] = csrf
+            headers["X-XSRF-TOKEN"] = csrf
+
+        # Chartink's process endpoint is most reliably handled as form data,
+        # not JSON. This avoids the empty-result issue caused by the old
+        # JSON-only request.
+        response = session.post(
             "https://chartink.com/screener/process",
             headers=headers,
-            json={"scan_clause": " ".join(clause.split())},
-            timeout=20,
+            data={"scan_clause": clause},
+            timeout=30,
         )
 
-        if r.status_code != 200:
-            return []
+        if response.status_code != 200:
+            return [], f"Chartink scanner HTTP {response.status_code}."
 
-        payload = r.json()
-        data = payload.get("data", [])
+        try:
+            payload = response.json()
+        except Exception:
+            preview = response.text[:180].replace("\n", " ")
+            return [], (
+                "Chartink returned a non-JSON response. "
+                f"Response starts with: {preview}"
+            )
+
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        if not data:
+            # Provide a useful distinction between authentication/session and
+            # a genuinely empty scanner result.
+            text_lower = page.text.lower()
+            if "login" in text_lower and "logout" not in text_lower:
+                return [], "Chartink session appears logged out/expired. Refresh the browser cookie."
+            return [], (
+                "Chartink returned 0 candidates. The cookie/session may be "
+                "expired, or the embedded scanner clause currently matches 0 stocks."
+            )
+
         symbols = []
-
         for row in data:
-            code = row.get("nsecode")
-            if code:
-                code = clean_symbol(code)
-                if code and code not in symbols:
-                    symbols.append(code)
+            if not isinstance(row, dict):
+                continue
+            code = (
+                row.get("nsecode")
+                or row.get("NSECODE")
+                or row.get("symbol")
+                or row.get("Symbol")
+            )
+            if not code:
+                continue
+            code = clean_symbol(code)
+            if code and code not in symbols:
+                symbols.append(code)
 
-        return symbols
-    except Exception:
-        return []
+        if not symbols:
+            return [], "Chartink returned rows, but no NSE symbols were present."
+
+        return symbols, f"Chartink OK: {len(symbols)} candidates."
+
+    except requests.RequestException as exc:
+        return [], f"Chartink network error: {exc}"
+    except Exception as exc:
+        return [], f"Chartink error: {type(exc).__name__}: {exc}"
 
 if discovery_mode == "Chartink Cookie":
+    screener_url = st.text_input(
+        "Chartink Screener URL",
+        value="https://chartink.com/screener/master-scanner-18062057",
+        help="The Chartink scanner page used for candidate discovery.",
+    )
     cookie = st.text_input(
         "Chartink browser cookie",
         type="password",
-        help="Used only to discover candidate stocks.",
+        help="Paste the current cookie string from your logged-in Chartink browser session.",
     )
 
     c1, c2 = st.columns(2)
@@ -328,15 +410,15 @@ if discovery_mode == "Chartink Cookie":
 
     if cookie:
         with st.spinner("Fetching latest Chartink candidates..."):
-            found = chartink_fetch(cookie)
+            found, status = chartink_fetch(cookie, screener_url)
 
         if found:
             st.session_state["chartink_symbols"] = found
-            st.success(f"{len(found)} Chartink candidates loaded.")
-        elif "chartink_symbols" not in st.session_state:
-            st.error(
-                "Chartink returned no candidates. Check cookie/scanner access."
-            )
+            st.success(status)
+        else:
+            st.error(status)
+            if "chartink_symbols" not in st.session_state:
+                st.info("Refresh your Chartink browser cookie and press Refresh Chartink Now.")
 
     symbols = st.session_state.get("chartink_symbols", [])
 

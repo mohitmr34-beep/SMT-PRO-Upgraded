@@ -390,23 +390,58 @@ st.subheader("2️⃣ Upstox Data Engine")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_instrument_master():
+    """
+    Download the Upstox instrument master.
+
+    The complete instrument file is gzip-compressed. Read the HTTP
+    response as bytes and explicitly decompress gzip before pandas parses it.
+    """
     urls = [
         "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz",
         "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz",
     ]
 
     last_error = None
+
     for url in urls:
         try:
-            r = requests.get(url, timeout=30)
-            r.raise_for_status()
-            return pd.read_csv(io.BytesIO(r.content))
+            response = requests.get(
+                url,
+                timeout=30,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "*/*",
+                },
+            )
+            response.raise_for_status()
+
+            content = response.content
+
+            if not content:
+                raise RuntimeError("Upstox returned an empty instrument file.")
+
+            # gzip magic header: hexadecimal 1F 8B
+            if content[:2] == bytes([0x1F, 0x8B]):
+                return pd.read_csv(
+                    io.BytesIO(content),
+                    compression="gzip",
+                    low_memory=False,
+                )
+
+            # Fallback for a plain CSV response.
+            return pd.read_csv(
+                io.BytesIO(content),
+                low_memory=False,
+            )
+
         except Exception as exc:
             last_error = exc
 
     raise RuntimeError(
-        f"Unable to download Upstox instrument master: {last_error}"
+        "Unable to download Upstox instrument master. "
+        f"Last error: {last_error}"
     )
+
 
 def build_equity_map(master):
     df = master.copy()

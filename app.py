@@ -1,1084 +1,954 @@
-import streamlit as st
+from pathlib import Path
+
+app_code = r'''import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import gzip
 import io
+import json
 import time
 from datetime import datetime, time as dtime
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 # ============================================================
-# CONFIG
+# SMT PRO SNIPER - INTRADAY
+# Chartink universe -> Upstox market data -> ATR/VWAP/RSI
 # ============================================================
+
 st.set_page_config(
-    page_title="SMT PRO SNIPER - NSE ALL STOCKS",
-    page_icon="🎯",
+    page_title="SMT PRO SNIPER",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 IST = ZoneInfo("Asia/Kolkata")
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1rem; padding-bottom: 1rem;}
+.small-box {
+    padding: 8px 12px; border-radius: 8px; background: #f5f5f5;
+    font-size: 14px; margin-bottom: 8px;
+}
+.trade-card {
+    padding: 14px; border-radius: 10px; margin: 8px 0;
+    color: white; font-size: 15px;
+}
+.buy {background: #168a45;}
+.sell {background: #c0392b;}
+.wait {background: #777;}
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------------
+# HEADER / IST CLOCK
+# -------------------------
+now_ist = datetime.now(IST)
 st.markdown(
-    """
-    <style>
-    .sniper-card {
-        padding:18px; border-radius:14px; margin:10px 0;
-        color:white; box-shadow:0 3px 12px rgba(0,0,0,.18);
-    }
-    .big {font-size:28px;font-weight:800;}
-    .metric {font-size:17px;margin-top:6px;}
-    </style>
-    """,
+    f"<div style='text-align:right;font-weight:600;'>IST: "
+    f"{now_ist.strftime('%d-%m-%Y %H:%M:%S')}</div>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<h2 style='text-align:center;'>SMT PRO SNIPER — INTRADAY</h2>",
     unsafe_allow_html=True,
 )
 
-st.title("🎯 SMT PRO SNIPER")
-st.caption(
-    "NSE all-equity intraday scanner | Chartink discovery → Upstox data → "
-    "VWAP + RSI + RVOL + structure + ATR + contradiction filter"
-)
-
-# ============================================================
-# SECRETS / UPSTOX
-# ============================================================
-def get_secret_token():
-    for key in ("UPSTOX_ACCESS_TOKEN", "UPSTOX_TOKEN", "UPSTOX_ACCESS"):
-        try:
-            value = st.secrets.get(key, "")
-            if value:
-                return str(value).strip()
-        except Exception:
-            pass
-    return ""
-
-UPSTOX_TOKEN = get_secret_token()
-
-# ============================================================
+# -------------------------
 # SETTINGS
-# ============================================================
-st.sidebar.header("⚙️ Scanner Settings")
-
-capital = st.sidebar.number_input(
-    "Capital (₹)", min_value=1000.0, value=50000.0, step=1000.0
-)
-risk_pct = st.sidebar.slider(
-    "Maximum risk / trade (%)", 0.25, 3.0, 1.0, 0.25
-)
-max_risk = capital * risk_pct / 100.0
-
-min_score = st.sidebar.slider("Minimum sniper score", 50, 90, 70)
-max_symbols = st.sidebar.number_input(
-    "Maximum Chartink candidates to process",
-    min_value=10, max_value=1000, value=300, step=10
-)
-min_rvol = st.sidebar.slider("Minimum RVOL", 0.8, 3.0, 1.2, 0.1)
-min_rr = st.sidebar.slider("Minimum R:R", 1.2, 3.0, 1.5, 0.1)
-
-st.sidebar.subheader("Intraday rules")
-market_start = dtime(9, 15)
-analysis_start = dtime(9, 16)
-avoid_after = dtime(15, 15)
-atr_period = st.sidebar.number_input(
-    "ATR period (5-min)", min_value=5, max_value=30, value=14
-)
-
-auto_refresh = st.sidebar.checkbox("Auto refresh every 60 seconds", True)
-
-# ============================================================
-# TIME
-# ============================================================
-def now_ist():
-    return datetime.now(IST)
-
-now = now_ist()
-current_time = now.time()
-
-if current_time < market_start:
-    st.warning(
-        f"Market scanner starts at 09:15 IST. Current time: "
-        f"{now:%H:%M:%S} IST"
+# -------------------------
+with st.sidebar:
+    st.header("⚙️ Scanner Settings")
+    refresh_seconds = st.number_input(
+        "Refresh interval (seconds)", min_value=30, max_value=900, value=60, step=30
     )
-elif current_time >= avoid_after:
-    st.info("New intraday entries are disabled after 15:15 IST.")
+    timeframe = st.selectbox("Data timeframe", ["1m", "5m"], index=0)
 
-if auto_refresh:
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=60_000, key="smt_sniper_60s")
-    except ImportError:
-        st.warning(
-            "Add `streamlit-autorefresh` to requirements.txt for "
-            "automatic 60-second refresh."
-        )
+    st.header("💰 Risk Management")
+    capital = st.number_input("Capital ₹", min_value=1000.0, value=50000.0, step=1000.0)
+    risk_pct = st.number_input(
+        "Risk per trade %", min_value=0.1, max_value=5.0, value=1.0, step=0.1
+    )
+    risk_amount = capital * risk_pct / 100.0
 
-# ============================================================
-# SAFE HELPERS
-# ============================================================
-def clean_symbol(x):
-    s = str(x).strip().upper()
-    for suffix in (".NS", "-EQ", ".NSE"):
-        if s.endswith(suffix):
-            s = s[: -len(suffix)]
-    return s.replace(" ", "")
+    st.header("🎯 Sniper Filters")
+    min_score = st.slider("Minimum score", 40, 100, 60)
+    min_volume_ratio = st.number_input(
+        "Minimum volume ratio", min_value=0.5, max_value=5.0, value=1.20, step=0.05
+    )
+    atr_sl_mult = st.number_input(
+        "ATR SL multiplier", min_value=0.5, max_value=3.0, value=1.0, step=0.1
+    )
+    atr_target_mult = st.number_input(
+        "ATR target multiplier", min_value=1.0, max_value=5.0, value=2.0, step=0.1
+    )
+    max_trades = st.number_input(
+        "Top trades", min_value=1, max_value=10, value=2, step=1
+    )
 
-def fnum(x, default=np.nan):
+    st.header("🔄 Data Source")
+    data_source = st.radio(
+        "Market data",
+        ["Upstox", "Yahoo fallback"],
+        index=0,
+    )
+
+# -------------------------
+# AUTO REFRESH
+# -------------------------
+if st.button("🔄 Refresh Now"):
+    st.rerun()
+
+st.caption(
+    f"Automatic refresh is intended for the scanner. Current interval: {refresh_seconds}s"
+)
+
+# -------------------------
+# SAFE NUMERIC HELPERS
+# -------------------------
+def scalar(x, default=np.nan):
     try:
         if isinstance(x, pd.Series):
-            if len(x) == 0:
+            if x.empty:
                 return default
-            x = x.iloc[-1]
+            x = x.iloc[0]
         if isinstance(x, (list, tuple, np.ndarray)):
             if len(x) == 0:
                 return default
-            x = x[-1]
+            x = x[0]
         return float(x)
     except Exception:
         return default
 
+
 def normalize_ohlcv(df):
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
+    if df is None or df.empty:
+        return None
 
-    out = df.copy()
+    df = df.copy()
 
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [
-            str(c[0] if isinstance(c, tuple) else c)
-            for c in out.columns
-        ]
+    if isinstance(df.columns, pd.MultiIndex):
+        # Prefer the first level when yfinance returns MultiIndex columns.
+        df.columns = [str(c[0]) for c in df.columns]
 
     rename = {}
-    for c in out.columns:
-        k = str(c).strip().lower()
-        mapping = {
-            "timestamp": "Timestamp",
-            "time": "Timestamp",
-            "datetime": "Timestamp",
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-            "vol": "Volume",
-        }
-        if k in mapping:
-            rename[c] = mapping[k]
+    for c in df.columns:
+        key = str(c).strip().lower()
+        if key == "open":
+            rename[c] = "Open"
+        elif key == "high":
+            rename[c] = "High"
+        elif key == "low":
+            rename[c] = "Low"
+        elif key == "close":
+            rename[c] = "Close"
+        elif key in ("volume", "vol"):
+            rename[c] = "Volume"
 
-    out = out.rename(columns=rename)
+    df = df.rename(columns=rename)
 
-    needed = ["Open", "High", "Low", "Close", "Volume"]
-    if not all(c in out.columns for c in needed):
-        return pd.DataFrame()
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in df.columns for c in required):
+        return None
 
-    for c in needed:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
+    for c in required:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    out = out.dropna(subset=needed).copy()
+    df = df[required].dropna()
+    return df if not df.empty else None
 
-    if "Timestamp" in out.columns:
-        out["Timestamp"] = pd.to_datetime(
-            out["Timestamp"], errors="coerce"
-        )
-        out = out.dropna(subset=["Timestamp"])
-        try:
-            if out["Timestamp"].dt.tz is None:
-                out["Timestamp"] = out["Timestamp"].dt.tz_localize(IST)
-            else:
-                out["Timestamp"] = out["Timestamp"].dt.tz_convert(IST)
-        except Exception:
-            pass
 
-    return out.reset_index(drop=True)
+# -------------------------
+# CHARTINK STOCK SOURCE
+# -------------------------
+st.subheader("1️⃣ Stock Universe")
 
-# ============================================================
-# CHARTINK DISCOVERY
-# ============================================================
-st.subheader("1️⃣ Stock Discovery")
-
-discovery_mode = st.radio(
-    "Candidate source",
-    ["Chartink Cookie", "Manual CSV / Symbols"],
+source = st.radio(
+    "Stock source",
+    ["CSV", "Chartink Cookie"],
     horizontal=True,
 )
 
-def chartink_fetch(cookie):
-    if not cookie:
-        return []
+symbols = []
 
-    session = requests.Session()
-    base_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
-            "Chrome/120 Safari/537.36"
-        ),
-        "Accept": "*/*",
-    }
+if source == "CSV":
+    uploaded = st.file_uploader("Upload Chartink CSV", type=["csv"])
 
-    try:
-        session.get(
-            "https://chartink.com/",
-            headers=base_headers,
-            timeout=15,
-        )
+    if uploaded is not None:
+        try:
+            csv_df = pd.read_csv(uploaded)
+            csv_df.columns = [str(c).strip() for c in csv_df.columns]
 
-        for part in cookie.split(";"):
-            if "=" in part:
-                k, v = part.strip().split("=", 1)
-                session.cookies.set(
-                    k.strip(), v.strip(), domain="chartink.com"
-                )
+            symbol_col = None
+            for candidate in ["Symbol", "symbol", "NSECODE", "nsecode", "NSE Code"]:
+                if candidate in csv_df.columns:
+                    symbol_col = candidate
+                    break
 
-        xsrf = unquote(session.cookies.get("XSRF-TOKEN", ""))
-        headers = dict(base_headers)
-        headers.update(
-            {
-                "Accept": "application/json, text/plain, */*",
+            if symbol_col is None:
+                st.error("CSV must contain Symbol / NSECODE column.")
+                st.stop()
+
+            for raw in csv_df[symbol_col].dropna():
+                s = str(raw).strip().upper()
+                if not s or s == "NAN":
+                    continue
+                if s.endswith(".NS"):
+                    symbols.append(s)
+                else:
+                    symbols.append(s + ".NS")
+
+            symbols = list(dict.fromkeys(symbols))
+
+            if symbols:
+                st.success(f"{len(symbols)} stocks loaded from CSV.")
+            else:
+                st.warning("CSV contains no usable symbols.")
+        except Exception as e:
+            st.error(f"CSV error: {e}")
+            st.stop()
+    else:
+        st.info("Upload your Chartink result CSV to scan those stocks.")
+
+else:
+    cookie = st.text_input("Chartink Cookie", type="password")
+    chartink_clause = st.text_area(
+        "Chartink scan clause",
+        value="""( {cash} ( ( {cash} ( ( {cash} (
+daily close >= daily max(252, daily high)*0.98
+and daily volume > daily sma(daily volume,20)*1.5
+and daily close > daily open
+) ) or ( {cash} (
+daily high >= daily max(252, daily high)
+and daily close < daily open
+and daily volume > daily sma(daily volume,20)*1.5
+) ) or ( {cash} (
+daily open > 1 day ago close*1.02
+and daily volume > daily sma(daily volume,20)*2
+and daily close > daily open
+) ) ) ) ) )""",
+        height=150,
+    )
+
+    @st.cache_data(ttl=60, show_spinner=False)
+    def chartink_symbols(cookie_text, clause):
+        if not cookie_text:
+            return [], "Cookie required"
+
+        try:
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/151 Safari/537.36"
+                ),
+                "Referer": "https://chartink.com/",
+            })
+
+            for part in cookie_text.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    session.cookies.set(k, v, domain="chartink.com")
+
+            home = session.get("https://chartink.com/", timeout=15)
+            xsrf = unquote(session.cookies.get("XSRF-TOKEN", ""))
+
+            headers = {
+                "User-Agent": session.headers["User-Agent"],
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": "https://chartink.com/",
                 "Content-Type": "application/json",
             }
-        )
-        if xsrf:
-            headers["X-XSRF-TOKEN"] = xsrf
+            if xsrf:
+                headers["X-XSRF-TOKEN"] = xsrf
 
-        # Candidate discovery only. Final trade decision is NOT based
-        # on this daily filter.
-        clause = """
-        (
-          {cash}
-          (
-            (
-              {cash}
-              (
-                daily close >= daily max(252, daily high)*0.98
-                and daily volume > daily sma(daily volume,20)*1.5
-                and daily close > daily open
-              )
+            payload = {"scan_clause": clause}
+
+            res = session.post(
+                "https://chartink.com/screener/process",
+                headers=headers,
+                json=payload,
+                timeout=30,
             )
-            or
-            (
-              {cash}
-              (
-                daily high >= daily max(252, daily high)
-                and daily close < daily open
-                and daily volume > daily sma(daily volume,20)*1.5
-              )
-            )
-            or
-            (
-              {cash}
-              (
-                daily open > 1 day ago close*1.02
-                and daily volume > daily sma(daily volume,20)*2
-                and daily close > daily open
-              )
-            )
-          )
-        )
-        """
 
-        r = session.post(
-            "https://chartink.com/screener/process",
-            headers=headers,
-            json={"scan_clause": " ".join(clause.split())},
-            timeout=20,
-        )
+            if res.status_code != 200:
+                return [], f"Chartink HTTP {res.status_code}"
 
-        if r.status_code != 200:
-            return []
+            try:
+                data = res.json().get("data", [])
+            except Exception:
+                return [], "Chartink did not return JSON."
 
-        payload = r.json()
-        data = payload.get("data", [])
-        symbols = []
+            out = []
+            for row in data:
+                code = row.get("nsecode")
+                if code:
+                    out.append(str(code).strip().upper() + ".NS")
 
-        for row in data:
-            code = row.get("nsecode")
-            if code:
-                code = clean_symbol(code)
-                if code and code not in symbols:
-                    symbols.append(code)
+            out = list(dict.fromkeys(out))
+            if not out:
+                return [], "No stocks returned by Chartink."
 
-        return symbols
-    except Exception:
-        return []
+            return out, ""
 
-if discovery_mode == "Chartink Cookie":
-    cookie = st.text_input(
-        "Chartink browser cookie",
-        type="password",
-        help="Used only to discover candidate stocks.",
-    )
+        except Exception as e:
+            return [], str(e)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        manual_refresh = st.button(
-            "🔄 Refresh Chartink Now",
-            use_container_width=True,
-        )
-    with c2:
-        clear_candidates = st.button(
-            "🗑️ Clear Candidates",
-            use_container_width=True,
-        )
-
-    if clear_candidates:
-        st.session_state.pop("chartink_symbols", None)
-        st.rerun()
-
-    if manual_refresh:
-        st.cache_data.clear()
-
-    if cookie:
-        with st.spinner("Fetching latest Chartink candidates..."):
-            found = chartink_fetch(cookie)
-
-        if found:
-            st.session_state["chartink_symbols"] = found
-            st.success(f"{len(found)} Chartink candidates loaded.")
-        elif "chartink_symbols" not in st.session_state:
-            st.error(
-                "Chartink returned no candidates. Check cookie/scanner access."
-            )
+    if st.button("📡 Fetch / Refresh Chartink Stocks"):
+        loaded, err = chartink_symbols(cookie, chartink_clause)
+        if loaded:
+            st.session_state["chartink_symbols"] = loaded
+            st.success(f"{len(loaded)} Chartink stocks loaded.")
+        else:
+            st.error(err)
 
     symbols = st.session_state.get("chartink_symbols", [])
 
-else:
-    uploaded = st.file_uploader(
-        "Upload CSV containing a Symbol column",
-        type=["csv"],
-    )
-    manual_text = st.text_area(
-        "Or enter NSE symbols separated by commas",
-        value="RELIANCE,SBIN,INFY,TCS,HDFCBANK,ICICIBANK",
-    )
+    if symbols:
+        st.success(f"Active universe: {len(symbols)} stocks")
+    else:
+        st.info("Enter the cookie and fetch Chartink stocks.")
+        st.stop()
 
-    symbols = []
-    if uploaded:
-        try:
-            csvdf = pd.read_csv(uploaded)
-            csvdf.columns = [str(c).strip() for c in csvdf.columns]
-            if "Symbol" not in csvdf.columns:
-                st.error("CSV must contain a `Symbol` column.")
-            else:
-                symbols.extend(
-                    clean_symbol(x)
-                    for x in csvdf["Symbol"].dropna()
-                )
-        except Exception as exc:
-            st.error(f"CSV error: {exc}")
-
-    symbols.extend(
-        clean_symbol(x)
-        for x in manual_text.split(",")
-        if clean_symbol(x)
-    )
-
-symbols = list(dict.fromkeys([s for s in symbols if s]))[: int(max_symbols)]
-
-st.info(
-    f"Candidates available: {len(symbols)} | "
-    f"Universe restriction: NONE — NSE equity candidates"
-)
-
-if not symbols:
-    st.stop()
-
-# ============================================================
-# UPSTOX INSTRUMENT MASTER
-# ============================================================
+# -------------------------
+# UPSTOX SETTINGS
+# -------------------------
 st.subheader("2️⃣ Upstox Data Engine")
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_instrument_master():
-    """
-    Download the Upstox instrument master.
+if data_source == "Upstox":
+    upstox_token = st.text_input(
+        "Upstox Access Token",
+        type="password",
+        help="Use your current Upstox OAuth access token.",
+    )
+else:
+    upstox_token = ""
 
-    The complete instrument file is gzip-compressed. Read the HTTP
-    response as bytes and explicitly decompress gzip before pandas parses it.
-    """
+# -------------------------
+# UPSTOX INSTRUMENT MASTER
+# -------------------------
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_upstox_instruments():
     urls = [
         "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz",
-        "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz",
+        "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz",
     ]
 
     last_error = None
 
     for url in urls:
         try:
-            response = requests.get(
-                url,
-                timeout=30,
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "*/*",
-                },
-            )
-            response.raise_for_status()
+            r = requests.get(url, timeout=40)
+            r.raise_for_status()
+            raw = r.content
 
-            content = response.content
+            # Correctly handle gzip regardless of HTTP content-type.
+            if raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
 
-            if not content:
-                raise RuntimeError("Upstox returned an empty instrument file.")
+            text = raw.decode("utf-8-sig")
 
-            # gzip magic header: hexadecimal 1F 8B
-            if content[:2] == bytes([0x1F, 0x8B]):
-                return pd.read_csv(
-                    io.BytesIO(content),
-                    compression="gzip",
-                    low_memory=False,
-                )
+            if url.endswith(".csv.gz"):
+                inst = pd.read_csv(io.StringIO(text), low_memory=False)
+            else:
+                obj = json.loads(text)
+                inst = pd.DataFrame(obj)
 
-            # Fallback for a plain CSV response.
-            return pd.read_csv(
-                io.BytesIO(content),
-                low_memory=False,
-            )
+            inst.columns = [str(c).strip() for c in inst.columns]
+            return inst
 
-        except Exception as exc:
-            last_error = exc
+        except Exception as e:
+            last_error = e
 
-    raise RuntimeError(
-        "Unable to download Upstox instrument master. "
-        f"Last error: {last_error}"
-    )
+    raise RuntimeError(f"Unable to download Upstox instrument master: {last_error}")
 
 
-def build_equity_map(master):
-    df = master.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+@st.cache_data(ttl=86400, show_spinner=False)
+def build_instrument_map():
+    inst = load_upstox_instruments()
 
-    # Upstox has used instrument_type / segment naming across versions.
-    segment = (
-        df.get("segment", pd.Series("", index=df.index))
-        .astype(str)
-        .str.upper()
-    )
-    instrument_type = (
-        df.get("instrument_type", pd.Series("", index=df.index))
-        .astype(str)
-        .str.upper()
-    )
-    exchange = (
-        df.get("exchange", pd.Series("", index=df.index))
-        .astype(str)
-        .str.upper()
-    )
+    # Upstox has changed column naming across master versions.
+    colmap = {str(c).lower().strip(): c for c in inst.columns}
 
-    mask = (
-        segment.str.contains("NSE_EQ", na=False)
-        | (
-            exchange.eq("NSE")
-            & instrument_type.isin(["EQ", "EQUITY"])
+    def find(*names):
+        for n in names:
+            if n.lower() in colmap:
+                return colmap[n.lower()]
+        return None
+
+    instrument_key = find("instrument_key")
+    trading_symbol = find("trading_symbol", "tradingsymbol", "symbol")
+    exchange = find("exchange")
+    segment = find("segment")
+
+    if instrument_key is None:
+        raise RuntimeError(
+            "Upstox instrument master does not contain instrument_key."
         )
-    )
-    eq = df[mask].copy()
 
-    if "trading_symbol" not in eq.columns:
-        raise RuntimeError("Upstox master lacks trading_symbol.")
+    if trading_symbol is None:
+        raise RuntimeError(
+            "Upstox master lacks trading_symbol/symbol. "
+            "Use a current complete instrument master."
+        )
 
-    key_col = "instrument_key"
-    if key_col not in eq.columns:
-        raise RuntimeError("Upstox master lacks instrument_key.")
+    mp = {}
 
-    result = {}
-    for _, row in eq.iterrows():
-        sym = clean_symbol(row.get("trading_symbol", ""))
-        key = str(row.get(key_col, "")).strip()
+    for _, row in inst.iterrows():
+        ex = str(row[exchange]).upper() if exchange else ""
+        seg = str(row[segment]).upper() if segment else ""
+        sym = str(row[trading_symbol]).strip().upper()
+
+        # NSE cash equities only.
+        if ex not in ("NSE", "NSE_EQ", "NSE_EQ."):
+            continue
+
+        if seg and "EQ" not in seg and "EQUITY" not in seg:
+            continue
+
+        key = str(row[instrument_key]).strip()
         if sym and key:
-            result[sym] = key
+            mp[sym] = key
 
-    return result
+    return mp
 
-try:
-    master = load_instrument_master()
-    symbol_map = build_equity_map(master)
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
 
-valid_symbols = [s for s in symbols if s in symbol_map]
-missing = [s for s in symbols if s not in symbol_map]
+# -------------------------
+# UPSTOX HISTORICAL DATA
+# -------------------------
+def upstox_candles(instrument_key, interval="1minute"):
+    if not upstox_token or not instrument_key:
+        return None
 
-if missing:
-    st.caption(
-        "Not mapped in Upstox NSE equity master: "
-        + ", ".join(missing[:25])
-    )
-
-if not valid_symbols:
-    st.error("No selected stocks could be mapped to Upstox NSE equity.")
-    st.stop()
-
-if not UPSTOX_TOKEN:
-    st.error(
-        "UPSTOX_ACCESS_TOKEN is missing. Add it to "
-        ".streamlit/secrets.toml."
-    )
-    st.stop()
-
-# ============================================================
-# UPSTOX V3 1-MINUTE DATA
-# ============================================================
-def upstox_headers():
-    return {
-        "Authorization": f"Bearer {UPSTOX_TOKEN}",
-        "Accept": "application/json",
-    }
-
-@st.cache_data(ttl=55, show_spinner=False)
-def get_intraday_1m(instrument_key):
-    url = (
-        "https://api.upstox.com/v3/historical-candle/intraday/"
-        f"{instrument_key}/1minute"
-    )
     try:
-        r = requests.get(
-            url,
-            headers=upstox_headers(),
-            timeout=15,
+        # Upstox V3 historical candle endpoint.
+        end = datetime.now(IST).strftime("%Y-%m-%d")
+        start = (datetime.now(IST).date()).strftime("%Y-%m-%d")
+
+        url = (
+            "https://api.upstox.com/v3/historical-candle/"
+            f"{requests.utils.quote(instrument_key, safe='')}/"
+            f"{interval}/{end}/{start}"
         )
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {upstox_token}",
+        }
+
+        r = requests.get(url, headers=headers, timeout=20)
         if r.status_code != 200:
-            return pd.DataFrame()
+            return None
 
         payload = r.json()
         candles = payload.get("data", {}).get("candles", [])
-        if not candles:
-            return pd.DataFrame()
 
-        # V3 candle format:
-        # [timestamp, open, high, low, close, volume, oi]
+        if not candles:
+            return None
+
+        # V3 candle:
+        # timestamp, open, high, low, close, volume, open_interest
         rows = []
         for c in candles:
             if len(c) < 6:
                 continue
-            rows.append(
-                {
-                    "Timestamp": c[0],
-                    "Open": c[1],
-                    "High": c[2],
-                    "Low": c[3],
-                    "Close": c[4],
-                    "Volume": c[5],
-                }
-            )
+            rows.append({
+                "Open": c[1],
+                "High": c[2],
+                "Low": c[3],
+                "Close": c[4],
+                "Volume": c[5],
+            })
+
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows)
+        return normalize_ohlcv(df)
+
+    except Exception:
+        return None
+
+
+def upstox_intraday(instrument_key):
+    if not upstox_token or not instrument_key:
+        return None
+
+    try:
+        url = (
+            "https://api.upstox.com/v3/historical-candle/intraday/"
+            f"{requests.utils.quote(instrument_key, safe='')}/1minute"
+        )
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {upstox_token}",
+        }
+
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code != 200:
+            return None
+
+        candles = r.json().get("data", {}).get("candles", [])
+        if not candles:
+            return None
+
+        rows = []
+        for c in candles:
+            if len(c) < 6:
+                continue
+            rows.append({
+                "Open": c[1],
+                "High": c[2],
+                "Low": c[3],
+                "Close": c[4],
+                "Volume": c[5],
+            })
 
         return normalize_ohlcv(pd.DataFrame(rows))
+
     except Exception:
-        return pd.DataFrame()
+        return None
 
-def get_5m_from_1m(one):
-    if one.empty:
-        return pd.DataFrame()
 
-    x = one.copy()
-    x["Timestamp"] = pd.to_datetime(
-        x["Timestamp"], errors="coerce"
-    )
-    x = x.dropna(subset=["Timestamp"])
+# -------------------------
+# YAHOO FALLBACK
+# -------------------------
+@st.cache_data(ttl=45, show_spinner=False)
+def yahoo_data(symbol, interval):
+    try:
+        import yfinance as yf
 
-    if x["Timestamp"].dt.tz is None:
-        x["Timestamp"] = x["Timestamp"].dt.tz_localize(IST)
-    else:
-        x["Timestamp"] = x["Timestamp"].dt.tz_convert(IST)
+        period = "5d" if interval == "1m" else "10d"
+        df = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        return normalize_ohlcv(df)
+    except Exception:
+        return None
 
-    x = x.set_index("Timestamp").sort_index()
 
-    agg = x.resample("5min", label="left", closed="left").agg(
-        {
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-        }
-    )
-    return agg.dropna().reset_index()
-
-# ============================================================
+# -------------------------
 # INDICATORS
-# ============================================================
+# -------------------------
 def add_indicators(df):
+    df = normalize_ohlcv(df)
+    if df is None or len(df) < 20:
+        return None
+
     x = df.copy()
-    if x.empty:
-        return x
 
     prev_close = x["Close"].shift(1)
-    tr = pd.concat(
-        [
-            x["High"] - x["Low"],
-            (x["High"] - prev_close).abs(),
-            (x["Low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    tr1 = x["High"] - x["Low"]
+    tr2 = (x["High"] - prev_close).abs()
+    tr3 = (x["Low"] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    x["ATR"] = tr.rolling(int(atr_period), min_periods=int(atr_period)).mean()
+    x["ATR"] = tr.rolling(14, min_periods=14).mean()
 
+    # Session VWAP. If timestamp is unavailable, cumulative VWAP is still
+    # calculated over the supplied intraday dataset.
     typical = (x["High"] + x["Low"] + x["Close"]) / 3
-    volume = x["Volume"].fillna(0)
-    cumulative_volume = volume.cumsum()
-    x["VWAP"] = (
-        (typical * volume).cumsum()
-        / cumulative_volume.replace(0, np.nan)
-    )
+    vol = x["Volume"].fillna(0)
+
+    if isinstance(x.index, pd.DatetimeIndex):
+        idx = x.index
+        if idx.tz is None:
+            try:
+                idx = idx.tz_localize("UTC").tz_convert(IST)
+            except Exception:
+                pass
+        else:
+            idx = idx.tz_convert(IST)
+
+        session = pd.Series(idx.date, index=x.index)
+        pv = typical * vol
+        x["VWAP"] = pv.groupby(session).cumsum() / vol.groupby(session).cumsum().replace(0, np.nan)
+    else:
+        x["VWAP"] = (typical * vol).cumsum() / vol.cumsum().replace(0, np.nan)
 
     delta = x["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
     x["RSI"] = 100 - (100 / (1 + rs))
+    x["RSI"] = x["RSI"].fillna(50)
 
-    x["RVOL"] = (
-        x["Volume"]
-        / x["Volume"].rolling(20, min_periods=5).mean().replace(0, np.nan)
-    )
+    x["VolMA"] = x["Volume"].rolling(20, min_periods=5).mean()
+    x["VolRatio"] = x["Volume"] / x["VolMA"].replace(0, np.nan)
 
-    x["EMA9"] = x["Close"].ewm(span=9, adjust=False).mean()
-    x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
+    return x.dropna(subset=["ATR", "VWAP"])
 
-    return x
 
-# ============================================================
-# CANDLE / STRUCTURE HELPERS
-# ============================================================
-def candle_features(row):
-    o = fnum(row["Open"])
-    h = fnum(row["High"])
-    l = fnum(row["Low"])
-    c = fnum(row["Close"])
+# -------------------------
+# SNIPER ANALYSIS
+# -------------------------
+def analyze_intraday(df):
+    x = add_indicators(df)
 
-    rng = max(h - l, 1e-9)
-    body = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-
-    return {
-        "range": rng,
-        "body": body,
-        "body_ratio": body / rng,
-        "upper_ratio": upper / rng,
-        "lower_ratio": lower / rng,
-        "bull": c > o,
-        "bear": c < o,
-        "close_position": (c - l) / rng,
-    }
-
-def position_size(entry, sl):
-    if not np.isfinite(entry) or not np.isfinite(sl):
-        return 0, 0.0, 0.0
-
-    risk_per_share = abs(entry - sl)
-    if risk_per_share <= 0:
-        return 0, 0.0, 0.0
-
-    qty_by_risk = int(max_risk / risk_per_share)
-    qty_by_capital = int(capital / entry)
-    qty = max(0, min(qty_by_risk, qty_by_capital))
-
-    return qty, qty * entry, qty * risk_per_share
-
-# ============================================================
-# SNIPER ANALYSIS — STOCK SPECIFIC, NO NIFTY DEPENDENCY
-# ============================================================
-def analyze_stock(symbol, one_min):
-    if one_min.empty or len(one_min) < 30:
+    if x is None or len(x) < 20:
         return {
-            "Stock": symbol, "Signal": "WAIT", "Score": 0,
-            "Reason": "Insufficient 1-minute data"
+            "Signal": "WAIT",
+            "Score": 0,
+            "Entry": np.nan,
+            "SL": np.nan,
+            "Target": np.nan,
+            "ATR": np.nan,
+            "VWAP": np.nan,
+            "RSI": np.nan,
+            "VolRatio": np.nan,
+            "Reason": "Insufficient data",
         }
 
-    x = get_5m_from_1m(one_min)
-    if len(x) < 25:
-        return {
-            "Stock": symbol, "Signal": "WAIT", "Score": 0,
-            "Reason": "Insufficient 5-minute structure"
-        }
-
-    x = add_indicators(x).dropna(subset=["ATR", "VWAP", "RSI"])
-    if len(x) < 8:
-        return {
-            "Stock": symbol, "Signal": "WAIT", "Score": 0,
-            "Reason": "Indicators not ready"
-        }
-
-    # Use the most recent completed 5-minute candle.
-    c3 = x.iloc[-1]
-    c2 = x.iloc[-2]
     c1 = x.iloc[-3]
+    c2 = x.iloc[-2]
+    c3 = x.iloc[-1]
 
-    price = fnum(c3["Close"])
-    vwap = fnum(c3["VWAP"])
-    rsi = fnum(c3["RSI"])
-    atr = fnum(c3["ATR"])
-    rvol = fnum(c3["RVOL"])
+    close = scalar(c3["Close"])
+    high = scalar(c3["High"])
+    low = scalar(c3["Low"])
 
-    cf = candle_features(c3)
+    h1, l1, cl1 = scalar(c1["High"]), scalar(c1["Low"]), scalar(c1["Close"])
+    h2, l2, cl2 = scalar(c2["High"]), scalar(c2["Low"]), scalar(c2["Close"])
 
-    # Recent stock-specific structure.
-    prior_high = fnum(x["High"].iloc[-6:-1].max())
-    prior_low = fnum(x["Low"].iloc[-6:-1].min())
+    atr = scalar(c3["ATR"])
+    vwap = scalar(c3["VWAP"])
+    rsi = scalar(c3["RSI"], 50)
+    vol_ratio = scalar(c3["VolRatio"], 0)
 
-    ema9 = fnum(c3["EMA9"])
-    ema20 = fnum(c3["EMA20"])
-    prev_ema9 = fnum(c2["EMA9"])
+    if not np.isfinite(atr) or atr <= 0:
+        return {
+            "Signal": "WAIT", "Score": 0, "Entry": np.nan,
+            "SL": np.nan, "Target": np.nan, "ATR": atr,
+            "VWAP": vwap, "RSI": rsi, "VolRatio": vol_ratio,
+            "Reason": "ATR unavailable"
+        }
 
-    vwap_rising = vwap > fnum(c2["VWAP"])
-    vwap_falling = vwap < fnum(c2["VWAP"])
+    # Candle structure
+    bullish = close > scalar(c3["Open"])
+    bearish = close < scalar(c3["Open"])
 
-    higher_structure = (
-        fnum(c3["High"]) >= fnum(c2["High"])
-        and fnum(c3["Low"]) >= fnum(c2["Low"])
-    )
-    lower_structure = (
-        fnum(c3["High"]) <= fnum(c2["High"])
-        and fnum(c3["Low"]) <= fnum(c2["Low"])
-    )
+    breakout_up = close > h2
+    breakout_down = close < l2
 
-    breakout_up = price > prior_high
-    breakout_down = price < prior_low
+    # Fakeout / contradiction
+    fake_up = (h2 > h1) and (cl2 <= h1) and (close < h2)
+    fake_down = (l2 < l1) and (cl2 >= l1) and (close > l2)
 
-    bullish = cf["bull"] and cf["close_position"] >= 0.65
-    bearish = cf["bear"] and cf["close_position"] <= 0.35
-
-    # Strong rejection wick = contradiction for a fresh breakout.
-    bad_upper = cf["upper_ratio"] > 0.45
-    bad_lower = cf["lower_ratio"] > 0.45
-
-    # ========================================================
-    # BUY
-    # ========================================================
-    buy_score = 0
+    score_buy = 0
+    score_sell = 0
     buy_reasons = []
-
-    if price > vwap:
-        buy_score += 20
-        buy_reasons.append("above VWAP")
-    else:
-        buy_reasons -= 25
-
-    if vwap_rising:
-        buy_score += 10
-        buy_reasons.append("VWAP rising")
-    else:
-        buy_score -= 15
-
-    if ema9 > ema20 and ema9 >= prev_ema9:
-        buy_score += 15
-        buy_reasons.append("5m trend up")
-
-    if breakout_up:
-        buy_score += 15
-        buy_reasons.append("level breakout")
-
-    if rvol >= min_rvol:
-        buy_score += 15
-        buy_reasons.append(f"RVOL {rvol:.1f}x")
-    else:
-        buy_score -= 10
-
-    if 52 <= rsi <= 68:
-        buy_score += 10
-        buy_reasons.append(f"RSI {rsi:.0f}")
-    elif rsi > 70:
-        buy_score -= 25
-    elif rsi < 35:
-        buy_score -= 10
-
-    if bullish:
-        buy_score += 10
-        buy_reasons.append("strong candle")
-
-    if higher_structure:
-        buy_score += 5
-
-    # ========================================================
-    # SELL
-    # ========================================================
-    sell_score = 0
     sell_reasons = []
 
-    if price < vwap:
-        sell_score += 20
-        sell_reasons.append("below VWAP")
-    else:
-        sell_score -= 25
-
-    if vwap_falling:
-        sell_score += 10
-        sell_reasons.append("VWAP falling")
-    else:
-        sell_score -= 15
-
-    if ema9 < ema20 and ema9 <= prev_ema9:
-        sell_score += 15
-        sell_reasons.append("5m trend down")
-
+    # Price / breakout
+    if breakout_up:
+        score_buy += 25
+        buy_reasons.append("breakout")
     if breakout_down:
-        sell_score += 15
-        sell_reasons.append("level breakdown")
+        score_sell += 25
+        sell_reasons.append("breakdown")
 
-    if rvol >= min_rvol:
-        sell_score += 15
-        sell_reasons.append(f"RVOL {rvol:.1f}x")
-    else:
-        sell_score -= 10
+    # VWAP
+    if close > vwap:
+        score_buy += 20
+        buy_reasons.append("above VWAP")
+    elif close < vwap:
+        score_sell += 20
+        sell_reasons.append("below VWAP")
 
-    if 32 <= rsi <= 48:
-        sell_score += 10
-        sell_reasons.append(f"RSI {rsi:.0f}")
-    elif rsi < 30:
-        sell_score -= 25
-    elif rsi > 65:
-        sell_score -= 10
+    # RSI quality zone, avoiding extreme chasing
+    if 52 <= rsi <= 70:
+        score_buy += 15
+        buy_reasons.append("RSI")
+    elif 30 <= rsi <= 48:
+        score_sell += 15
+        sell_reasons.append("RSI")
 
-    if bearish:
-        sell_score += 10
-        sell_reasons.append("strong candle")
+    # Volume
+    if vol_ratio >= min_volume_ratio:
+        if bullish:
+            score_buy += 20
+            buy_reasons.append("volume")
+        if bearish:
+            score_sell += 20
+            sell_reasons.append("volume")
 
-    if lower_structure:
-        sell_score += 5
+    # Candle confirmation
+    if bullish and close > h2:
+        score_buy += 10
+        buy_reasons.append("candle confirmation")
+    if bearish and close < l2:
+        score_sell += 10
+        sell_reasons.append("candle confirmation")
 
-    # ========================================================
-    # CONTRADICTION FILTERS
-    # ========================================================
-    buy_contradiction = (
-        price <= vwap
-        or rsi >= 70
-        or vwap_falling
-        or bad_upper
-    )
-    sell_contradiction = (
-        price >= vwap
-        or rsi <= 30
-        or vwap_rising
-        or bad_lower
-    )
+    # Contradiction penalties
+    if fake_up:
+        score_buy -= 25
+    if fake_down:
+        score_sell -= 25
 
-    # Avoid very tiny or abnormally huge ATR.
-    candle_range = fnum(c3["High"]) - fnum(c3["Low"])
-    if atr <= 0 or candle_range <= 0:
-        return {
-            "Stock": symbol, "Signal": "WAIT", "Score": 0,
-            "Reason": "Invalid ATR/range"
-        }
+    if close < vwap:
+        score_buy -= 20
+    if close > vwap:
+        score_sell -= 20
 
-    if candle_range > 2.5 * atr:
-        buy_score -= 15
-        sell_score -= 15
+    # Avoid overextended RSI
+    if rsi > 75:
+        score_buy -= 15
+    if rsi < 25:
+        score_sell -= 15
 
-    # ========================================================
-    # ATR STRUCTURE SL / TARGET
-    # ========================================================
     signal = "WAIT"
-    score = max(0, int(max(buy_score, sell_score)))
+    score = max(score_buy, score_sell)
     entry = sl = target = np.nan
-    reason = ""
+    reason = "No complete sniper confirmation"
 
-    if buy_score >= min_score and not buy_contradiction:
-        # Structure SL, but reject if it is too wide.
-        raw_sl = min(fnum(c2["Low"]), fnum(c1["Low"]))
-        risk_distance = price - raw_sl
+    if score_buy >= min_score and score_buy > score_sell:
+        signal = "BUY"
+        entry = close
+        sl = min(l2, entry - atr * atr_sl_mult)
+        # Make sure SL remains below entry.
+        if sl >= entry:
+            sl = entry - atr * atr_sl_mult
+        target = entry + atr * atr_target_mult
+        reason = ", ".join(buy_reasons)
 
-        if (
-            risk_distance >= 0.7 * atr
-            and risk_distance <= 1.8 * atr
-            and raw_sl < price
-        ):
-            signal = "BUY"
-            entry = price
-            sl = raw_sl
-            target = entry + 2.0 * risk_distance
-            reason = " + ".join(buy_reasons)
-
-    elif sell_score >= min_score and not sell_contradiction:
-        raw_sl = max(fnum(c2["High"]), fnum(c1["High"]))
-        risk_distance = raw_sl - price
-
-        if (
-            risk_distance >= 0.7 * atr
-            and risk_distance <= 1.8 * atr
-            and raw_sl > price
-        ):
-            signal = "SELL"
-            entry = price
-            sl = raw_sl
-            target = entry - 2.0 * risk_distance
-            reason = " + ".join(sell_reasons)
-
-    if signal == "WAIT":
-        if buy_score >= sell_score:
-            score = max(0, int(buy_score))
-            reason = "BUY rejected by contradiction/ATR-quality filter"
-        else:
-            score = max(0, int(sell_score))
-            reason = "SELL rejected by contradiction/ATR-quality filter"
-
-    risk_share = abs(entry - sl) if signal != "WAIT" else np.nan
-    rr = (
-        abs(target - entry) / risk_share
-        if signal != "WAIT" and risk_share > 0
-        else np.nan
-    )
-
-    if signal != "WAIT" and rr < min_rr:
-        signal = "WAIT"
-        reason = "R:R below minimum"
-        entry = sl = target = np.nan
-        risk_share = rr = np.nan
-
-    qty, cap_used, actual_risk = position_size(entry, sl)
-
-    # If quantity is zero, don't issue a trade.
-    if signal != "WAIT" and qty <= 0:
-        signal = "WAIT"
-        reason = "Quantity is zero under capital/risk limits"
-        entry = sl = target = np.nan
-        risk_share = rr = np.nan
-        cap_used = actual_risk = 0
+    elif score_sell >= min_score and score_sell > score_buy:
+        signal = "SELL"
+        entry = close
+        sl = max(h2, entry + atr * atr_sl_mult)
+        if sl <= entry:
+            sl = entry + atr * atr_sl_mult
+        target = entry - atr * atr_target_mult
+        reason = ", ".join(sell_reasons)
 
     return {
-        "Stock": symbol,
         "Signal": signal,
-        "Score": int(max(0, score)),
-        "Reason": reason,
-        "LTP": price,
-        "VWAP": vwap,
-        "RSI": rsi,
-        "ATR(5m)": atr,
-        "RVOL": rvol,
+        "Score": max(0, int(score)),
         "Entry": entry,
         "SL": sl,
         "Target": target,
-        "Risk/Share": risk_share,
-        "Qty": int(qty),
-        "Capital Used": cap_used,
-        "Actual Risk": actual_risk,
-        "R:R": rr,
+        "ATR": atr,
+        "VWAP": vwap,
+        "RSI": rsi,
+        "VolRatio": vol_ratio,
+        "Reason": reason,
     }
 
-# ============================================================
-# SCAN
-# ============================================================
-st.subheader("3️⃣ Intraday Sniper Scan")
 
-scan_button = st.button(
-    "🚀 RUN / REFRESH SNIPER",
-    type="primary",
-    use_container_width=True,
-)
+# -------------------------
+# POSITION SIZING
+# -------------------------
+def position_size(entry, sl):
+    entry = scalar(entry)
+    sl = scalar(sl)
 
-if scan_button or auto_refresh:
+    if not np.isfinite(entry) or not np.isfinite(sl):
+        return 0, 0.0, 0.0
+
+    distance = abs(entry - sl)
+    if distance <= 0:
+        return 0, 0.0, 0.0
+
+    qty_by_risk = int(risk_amount // distance)
+    qty_by_capital = int(capital // entry)
+
+    qty = max(0, min(qty_by_risk, qty_by_capital))
+    capital_used = qty * entry
+    actual_risk = qty * distance
+
+    return qty, capital_used, actual_risk
+
+
+# -------------------------
+# FETCH ONE STOCK
+# -------------------------
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_stock(symbol, source_name, token, interval):
+    if source_name == "Upstox":
+        try:
+            mp = build_instrument_map()
+            nse = symbol.replace(".NS", "").upper()
+            key = mp.get(nse)
+
+            if key:
+                df = upstox_intraday(key)
+                if df is not None and len(df) >= 20:
+                    return df
+
+                df = upstox_candles(key, "1minute")
+                if df is not None and len(df) >= 20:
+                    return df
+        except Exception:
+            pass
+
+        # Deliberate fallback when Upstox master/data is temporarily unavailable.
+        return yahoo_data(symbol, interval)
+
+    return yahoo_data(symbol, interval)
+
+
+# -------------------------
+# RUN SCANNER
+# -------------------------
+st.subheader("3️⃣ Intraday Sniper Scanner")
+
+if not symbols:
+    st.warning("No stocks available.")
+    st.stop()
+
+st.write(f"Scanning **{len(symbols)}** stocks from the selected universe.")
+
+if st.button("🚀 RUN SNIPER SCANNER", type="primary"):
     results = []
-
     progress = st.progress(0)
-    total = len(valid_symbols)
 
-    for i, symbol in enumerate(valid_symbols, start=1):
-        candles = get_intraday_1m(symbol_map[symbol])
-        row = analyze_stock(symbol, candles)
-        results.append(row)
-        progress.progress(i / total)
+    for i, sym in enumerate(symbols):
+        df = fetch_stock(sym, data_source, upstox_token, timeframe)
 
-    progress.empty()
+        try:
+            a = analyze_intraday(df)
+        except Exception as e:
+            a = {
+                "Signal": "WAIT",
+                "Score": 0,
+                "Entry": np.nan,
+                "SL": np.nan,
+                "Target": np.nan,
+                "ATR": np.nan,
+                "VWAP": np.nan,
+                "RSI": np.nan,
+                "VolRatio": np.nan,
+                "Reason": f"Analysis error: {str(e)[:80]}",
+            }
+
+        qty, cap_used, actual_risk = position_size(a["Entry"], a["SL"])
+
+        results.append({
+            "Stock": sym.replace(".NS", ""),
+            "Signal": a["Signal"],
+            "Score": a["Score"],
+            "Entry": round(scalar(a["Entry"]), 2) if np.isfinite(scalar(a["Entry"])) else np.nan,
+            "SL": round(scalar(a["SL"]), 2) if np.isfinite(scalar(a["SL"])) else np.nan,
+            "Target": round(scalar(a["Target"]), 2) if np.isfinite(scalar(a["Target"])) else np.nan,
+            "ATR": round(scalar(a["ATR"]), 2) if np.isfinite(scalar(a["ATR"])) else np.nan,
+            "VWAP": round(scalar(a["VWAP"]), 2) if np.isfinite(scalar(a["VWAP"])) else np.nan,
+            "RSI": round(scalar(a["RSI"]), 1) if np.isfinite(scalar(a["RSI"])) else np.nan,
+            "Vol Ratio": round(scalar(a["VolRatio"]), 2) if np.isfinite(scalar(a["VolRatio"])) else np.nan,
+            "Qty": qty,
+            "Capital Used ₹": round(cap_used, 0),
+            "Risk ₹": round(actual_risk, 0),
+            "Reason": a["Reason"],
+        })
+
+        progress.progress((i + 1) / len(symbols))
 
     result_df = pd.DataFrame(results)
 
-    if not result_df.empty:
-        result_df = result_df.sort_values(
-            ["Signal", "Score"],
-            ascending=[True, False],
-        )
+    # Score first, then signal, for useful ranking.
+    result_df = result_df.sort_values(
+        ["Score", "Signal"],
+        ascending=[False, True]
+    ).reset_index(drop=True)
 
-        show_cols = [
-            "Stock", "Signal", "Score", "Reason", "LTP",
-            "VWAP", "RSI", "ATR(5m)", "RVOL",
-            "Entry", "SL", "Target", "Risk/Share",
-            "Qty", "Capital Used", "Actual Risk", "R:R",
-        ]
-        show_cols = [c for c in show_cols if c in result_df.columns]
+    st.subheader("📊 Scanner Results")
 
-        st.dataframe(
-            result_df[show_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        trades = result_df[
-            (result_df["Signal"].isin(["BUY", "SELL"]))
-            & (result_df["Score"] >= min_score)
-        ].sort_values("Score", ascending=False)
-
-        st.subheader("🔥 TOP QUALITY INTRADAY TRADES")
-
-        if trades.empty:
-            st.warning(
-                "No stock passed all sniper filters. This is intentional: "
-                "WAIT is preferred over a low-quality trade."
-            )
-        else:
-            for _, r in trades.head(2).iterrows():
-                buy = r["Signal"] == "BUY"
-                bg = "#16803c" if buy else "#b42318"
-
-                st.markdown(
-                    f"""
-                    <div class="sniper-card" style="background:{bg};">
-                        <div class="big">
-                            {r['Stock']} — {r['Signal']}
-                        </div>
-                        <div class="metric">
-                            Score <b>{int(r['Score'])}/100</b> |
-                            Qty <b>{int(r['Qty'])}</b> |
-                            Risk <b>₹{fnum(r['Actual Risk']):,.0f}</b>
-                        </div>
-                        <div class="metric">
-                            Entry <b>₹{fnum(r['Entry']):,.2f}</b> |
-                            SL <b>₹{fnum(r['SL']):,.2f}</b> |
-                            Target <b>₹{fnum(r['Target']):,.2f}</b>
-                        </div>
-                        <div class="metric">
-                            VWAP ₹{fnum(r['VWAP']):,.2f} |
-                            RSI {fnum(r['RSI']):.1f} |
-                            ATR {fnum(r['ATR(5m)']):,.2f} |
-                            RVOL {fnum(r['RVOL']):.1f}x |
-                            R:R {fnum(r['R:R']):.2f}
-                        </div>
-                        <div style="margin-top:8px;">
-                            {r['Reason']}
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-        # Useful diagnostic: how many failed each broad stage.
-        st.subheader("🔎 Scanner Diagnostics")
-        diag = {
-            "Candidates": len(result_df),
-            "BUY signals": int((result_df["Signal"] == "BUY").sum()),
-            "SELL signals": int((result_df["Signal"] == "SELL").sum()),
-            "WAIT": int((result_df["Signal"] == "WAIT").sum()),
-            "Score ≥ minimum": int(
-                (result_df["Score"] >= min_score).sum()
-            ),
-        }
-        st.json(diag)
-
-else:
-    st.info(
-        "Press RUN / REFRESH SNIPER. With auto-refresh enabled, "
-        "the page rescans approximately every 60 seconds."
+    # Smaller, readable dataframe rather than oversized cards.
+    st.dataframe(
+        result_df,
+        use_container_width=True,
+        height=520,
+        hide_index=True,
     )
 
-# ============================================================
-# IMPORTANT NOTES
-# ============================================================
-st.divider()
+    qualified = result_df[
+        result_df["Signal"].isin(["BUY", "SELL"])
+        & (result_df["Score"] >= min_score)
+        & (result_df["Qty"] > 0)
+    ].head(int(max_trades))
+
+    st.subheader("🔥 TOP SNIPER TRADES")
+
+    if qualified.empty:
+        st.warning("No stock passed all sniper filters.")
+    else:
+        for _, r in qualified.iterrows():
+            css = "buy" if r["Signal"] == "BUY" else "sell"
+
+            st.markdown(
+                f"""
+                <div class="trade-card {css}">
+                    <b>{r['Stock']} — {r['Signal']} | Score {r['Score']}/100</b><br>
+                    Entry: ₹{r['Entry']} &nbsp; | &nbsp;
+                    SL: ₹{r['SL']} &nbsp; | &nbsp;
+                    Target: ₹{r['Target']}<br>
+                    ATR: ₹{r['ATR']} &nbsp; | &nbsp;
+                    VWAP: ₹{r['VWAP']} &nbsp; | &nbsp;
+                    RSI: {r['RSI']} &nbsp; | &nbsp;
+                    Vol Ratio: {r['Vol Ratio']}<br>
+                    <b>Maximum Qty: {r['Qty']}</b> &nbsp; | &nbsp;
+                    Capital: ₹{r['Capital Used ₹']} &nbsp; | &nbsp;
+                    Risk: ₹{r['Risk ₹']}<br>
+                    {r['Reason']}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # Download current scan.
+    st.download_button(
+        "⬇️ Download Scanner CSV",
+        result_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"smt_sniper_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+    )
+
+# -------------------------
+# AUTOMATIC PAGE REFRESH
+# -------------------------
+# This does not force a 15:15 cutoff. It simply refreshes the page
+# during the session at the user-selected interval.
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(
+        interval=int(refresh_seconds) * 1000,
+        key="smt_sniper_refresh",
+    )
+except Exception:
+    pass
+
 st.caption(
-    "No Nifty-50 dependency. Chartink is candidate discovery only. "
-    "Final decisions are stock-specific. ATR SL/target and quantity are "
-    "calculated from the selected stock's intraday structure. "
-    "Educational use only; verify live price and execution before trading."
+    "SMT PRO SNIPER is an intraday decision-support scanner. "
+    "Entry, SL, target and quantity are calculated from the current intraday data, "
+    "ATR, VWAP, RSI and volume. Confirm execution and liquidity before trading."
 )
+'''
+
+out = Path("/mnt/data/app.py")
+req = Path("/mnt/data/requirements.txt")
+
+compile(app_code, str(out), "exec")
+out.write_text(app_code, encoding="utf-8")
+req.write_text(
+    "streamlit>=1.40\n"
+    "pandas>=2.0\n"
+    "numpy>=1.26\n"
+    "requests>=2.31\n"
+    "yfinance>=0.2.40\n"
+    "streamlit-autorefresh>=1.0.1\n",
+    encoding="utf-8",
+)
+
+print(f"Created: {out}")
+print(f"Created: {req}")
+print(f"app.py lines: {len(app_code.splitlines())}")

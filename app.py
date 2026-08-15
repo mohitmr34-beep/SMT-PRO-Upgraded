@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import requests
 import io
+import gzip
+import json
 import time
 from datetime import datetime, time as dtime
 from urllib.parse import unquote
@@ -386,23 +388,32 @@ st.subheader("2️⃣ Upstox Data Engine")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_instrument_master():
+    # Upstox recommends the JSON instrument master. The file is gzip-compressed.
     urls = [
-        "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz",
-        "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz",
+        "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz",
+        "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
     ]
-
     last_error = None
     for url in urls:
         try:
-            r = requests.get(url, timeout=30)
+            r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
             r.raise_for_status()
-            return pd.read_csv(io.BytesIO(r.content))
+            raw = r.content
+            if raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            data = json.loads(raw.decode("utf-8-sig"))
+            if isinstance(data, list):
+                records = data
+            elif isinstance(data, dict):
+                records = data.get("data", [])
+            else:
+                records = []
+            if not isinstance(records, list) or not records:
+                raise RuntimeError("Upstox instrument JSON returned no records.")
+            return pd.DataFrame(records)
         except Exception as exc:
             last_error = exc
-
-    raise RuntimeError(
-        f"Unable to download Upstox instrument master: {last_error}"
-    )
+    raise RuntimeError(f"Unable to download Upstox instrument master: {last_error}")
 
 def build_equity_map(master):
     df = master.copy()
